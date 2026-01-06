@@ -1,218 +1,348 @@
----
-# AirWatch Delhi – Recent Backend Enhancements
+# AirWatch Delhi – Service-Level Explanation (New Additions)
 
-This update extends the existing **AirWatch Delhi** backend with **location-aware AQI fetching**, **robust OpenAQ integration**, and an **AI-powered chatbot**, while preserving the original architecture and design principles.
-
-All changes were implemented as **additive extensions**, ensuring **no refactoring or breakage** of existing services.
----
-
-## Summary of Changes (Today)
-
-### 1. Point + Radius–Based AQI Fetching (User Location Support)
-
-- Added support for fetching air quality data based on **user latitude and longitude**
-- Uses **OpenAQ point + radius queries** instead of fixed sensor IDs
-- Enables personalized, location-aware AQI responses
-
-**Why this matters**
-
-- Pollution varies significantly within cities
-- Ward or city averages are insufficient for individual users
-- This allows accurate AQI insights even when users are not near a predefined area
+This document explains the **new backend services introduced today**, their responsibilities, and how they integrate with the existing AQI pipeline.
+All services were designed to be **additive**, **isolated**, and **non-invasive**.
 
 ---
 
-### 2. Progressive Radius Expansion (Fault Tolerance)
+## 1. `openaq_point_service.py`
 
-- Implemented **automatic radius expansion** when no sensors are found nearby
-- Starts with a small radius (e.g. 5 km) and gradually expands (up to a safe maximum)
-- Prevents empty or failed AQI responses in low-sensor-density regions
+### Purpose
 
-**How it works**
+Handles **all interaction with the OpenAQ API** for **point + radius–based air quality data fetching**, including fallback logic when nearby sensors are unavailable.
 
-- Logic lives entirely in `openaq_point_service.py`
-- The system retries OpenAQ queries with increasing radius until data is found or the maximum radius is reached
-- Returns metadata such as:
-
-  - `used_radius_km`
-  - `sensor_count`
-
-This ensures transparency and explainability.
+This service is the **only place** where OpenAQ is accessed.
 
 ---
 
-### 3. Clean Integration into Existing AQI Pipeline
+### Why This Service Exists
 
-No changes were made to:
-
-- AQI calculation logic
-- Pollutant normalization
-- Risk scoring
-- Reasoning engine
-- Cache behavior
-
-Instead:
-
-- A new orchestration entrypoint `get_point_air_quality()` was added
-- This function fetches OpenAQ data and **reuses the existing pipeline** (`get_area_air_quality`)
-- Caching remains centralized and consistent
-
-**Result**
-
-- Area-based AQI and point-based AQI now coexist
-- Both flows share the same AQI math, reasoning, and risk logic
+- Users provide **latitude and longitude**, not sensor IDs
+- Sensor coverage can be sparse or uneven
+- The system must be robust to missing data
+- External API logic must remain isolated from orchestration and AQI math
 
 ---
 
-### 4. Metadata-Aware Caching
+### Core Function
 
-- Cache keys for point-based AQI include the **actual radius used**
-- Prevents incorrect cache hits when fallback radius expansion occurs
+```python
+fetch_measurements_by_point(
+    lat,
+    lon,
+    radius_km=5,
+    max_radius_km=25,
+    step_km=5
+)
+```
 
-Example cache key:
+---
+
+### How It Works (Step-by-Step)
+
+1. Starts querying OpenAQ using a **small radius** around the given point
+2. If **no sensors are found**, the radius is increased incrementally
+3. Retries until:
+
+   - Measurements are found, or
+   - The maximum radius is reached
+
+4. Aggregates raw measurements by pollutant
+5. Returns both data and metadata for transparency
+
+---
+
+### Output Format
+
+```json
+{
+  "pollutants": {
+    "pm25": [120.0, 135.2],
+    "pm10": [210.4],
+    "no2": [42.1]
+  },
+  "used_radius_km": 15,
+  "sensor_count": 3
+}
+```
+
+---
+
+### Key Design Decisions
+
+- **Progressive radius expansion** avoids silent failures
+- **No AQI math** performed here
+- **No caching** performed here
+- Returns **raw values**, not averages, to preserve flexibility
+- Metadata enables explainability and confidence scoring downstream
+
+---
+
+## 2. `_fetch_raw_measurements_from_point` (in `area_service.py`)
+
+### Purpose
+
+Acts as a **bridge** between OpenAQ data and the existing AQI pipeline.
+
+The AQI pipeline expects `raw_measurements` in a specific format; this helper adapts OpenAQ output without modifying downstream logic.
+
+---
+
+### Why This Exists
+
+- Avoids refactoring `normalize_pollutants`
+- Keeps OpenAQ-specific structures out of AQI logic
+- Maintains backward compatibility with area-based AQI
+
+---
+
+### What It Does
+
+1. Calls `fetch_measurements_by_point`
+2. Converts pollutant buckets into a flat list of measurements
+3. Returns:
+
+   - `raw_measurements` (pipeline-compatible)
+   - `meta` (radius and sensor information)
+
+---
+
+### Example Output
+
+```python
+[
+  {"parameter": "pm25", "value": 120.0},
+  {"parameter": "pm25", "value": 135.2},
+  {"parameter": "pm10", "value": 210.4}
+]
+```
+
+Metadata:
+
+```json
+{
+  "used_radius_km": 15,
+  "sensor_count": 3
+}
+```
+
+---
+
+### Important Notes
+
+- Does **not** normalize values
+- Does **not** calculate AQI
+- Does **not** cache results
+
+---
+
+## 3. `get_point_air_quality` (in `area_service.py`)
+
+### Purpose
+
+Provides a **new orchestration entrypoint** for **location-based AQI**, while fully reusing the existing AQI pipeline.
+
+This function is the **only correct way** to calculate AQI from `(lat, lon)`.
+
+---
+
+### Why This Function Exists
+
+- Keeps orchestration logic centralized
+- Allows point-based and area-based AQI to coexist
+- Avoids branching logic in views
+- Preserves cache semantics
+
+---
+
+### High-Level Flow
+
+```
+(lat, lon)
+   ↓
+OpenAQ point + radius fetch
+   ↓
+Convert to raw measurements
+   ↓
+Reuse get_area_air_quality()
+```
+
+---
+
+### Detailed Steps
+
+1. Fetch raw measurements using point + radius logic
+2. If no sensors are found:
+
+   - Return a safe, explainable `no_data` response
+
+3. Construct a **cache key using the actual radius used**
+4. Check cache
+5. Reuse `get_area_air_quality` to run:
+
+   - Normalization
+   - AQI calculation
+   - Reasoning
+   - Risk scoring
+
+6. Attach metadata to final response
+
+---
+
+### Example Cache Key
 
 ```
 point:28.6139,77.2090:15km
 ```
 
-This ensures correctness and avoids subtle data inconsistencies.
+This prevents incorrect cache reuse when fallback radius expansion occurs.
 
 ---
 
-### 5. AI-Powered Chatbot Integration (Google Gemini)
+### Why This Is Architecturally Correct
 
-- Integrated a **context-aware chatbot** using **Google Gemini Free Tier**
-- Chatbot provides:
-
-  - Safety advice for citizens
-  - Mitigation and policy suggestions for authorities
-
-- Responses are generated using **real AQI, pollutant, and weather data**
-
-**Key design choices**
-
-- AI logic is isolated in `chatbot_service.py`
-- Views do not talk to Gemini directly
-- API keys are never exposed to the frontend
-- Prompts are dynamically generated using live environmental data
+- No AQI math duplication
+- No OpenAQ calls in views
+- No changes to existing pipeline
+- Fully backward compatible
 
 ---
 
-## New Services Added
+## 4. `chatbot_service.py`
 
-### `services/openaq_point_service.py`
+### Purpose
 
-Handles:
+Provides **AI-generated, context-aware guidance** based on:
 
-- OpenAQ point + radius queries
-- Progressive radius expansion
-- Raw pollutant aggregation
-- Sensor metadata collection
-
-No AQI math or orchestration logic lives here.
-
----
-
-### `services/chatbot_service.py`
-
-Handles:
-
-- Dynamic prompt construction
-- Google Gemini API calls
-- Context-aware AI responses
-
-This service consumes:
-
-- AQI results
-- Pollutant values
-- Weather data
+- AQI data
+- Pollutant composition
+- Weather conditions
 - User role (citizen / authority)
 
----
-
-## Updated Orchestration Flow
-
-### Point-Based AQI Flow
-
-```
-Frontend (lat, lon)
-   ↓
-get_point_air_quality()
-   ↓
-OpenAQ point + radius fetch (with fallback)
-   ↓
-Existing normalization
-   ↓
-Existing AQI calculation
-   ↓
-Existing reasoning engine
-   ↓
-Existing risk scoring
-   ↓
-Cached + response returned
-```
-
-### Chatbot Flow
-
-```
-Frontend (query + AQI + weather)
-   ↓
-chatbot_view
-   ↓
-chatbot_service (Gemini)
-   ↓
-Contextual safety / mitigation advice
-```
+Uses **Google Gemini Free Tier**.
 
 ---
 
-## API Endpoints Added / Updated
+### Why This Service Exists
 
-### Point-Based AQI
+- Chatbot logic must be isolated from HTTP handling
+- AI prompts must be dynamically constructed
+- External AI APIs must not leak into views
+- Easy replacement or removal of AI layer if needed
+
+---
+
+### Core Responsibilities
+
+1. Build a **structured, data-rich prompt**
+2. Send the prompt to Gemini
+3. Return clean, readable text for the frontend
+
+---
+
+### Prompt Structure (Conceptual)
 
 ```
-GET /api/point-aqi/?lat=<lat>&lon=<lon>&radius=<km>
-```
-
-### Chatbot
-
-```
-POST /api/chatbot/
+Role (Citizen / Authority)
+↓
+Current AQI & category
+↓
+Dominant pollutant
+↓
+Pollutant levels
+↓
+Weather context
+↓
+User question
+↓
+Actionable response
 ```
 
 ---
 
-## Architectural Principles Preserved
+### Example Prompt Context
 
-- AQI math lives **only** in `calculate_aqi.py`
-- Orchestration lives **only** in `area_service.py`
-- Cache logic lives **only** in `cache.py`
-- Views handle HTTP only
-- External APIs are isolated in service layers
-- All new features are **additive and reversible**
+- AQI: 235 (Poor)
+- Dominant pollutant: PM2.5
+- Wind speed: 1.5 m/s
+- User: Citizen
+- Question: “Is it safe to exercise outdoors?”
 
----
-
-## Why This Approach Is Robust
-
-- Works even with sparse sensor coverage
-- Fully explainable and auditable
-- No hardcoded sensor dependencies
-- Safe for hackathons and real-world deployment
-- Ready for future extensions (forecasting, confidence scoring, persistence)
+This ensures responses are **situational, not generic**.
 
 ---
 
-## Next Possible Enhancements (Future Work)
+### What This Service Does NOT Do
 
-- AQI trend analysis using cached history
-- Confidence score based on sensor count and dispersion
-- Staleness filtering for OpenAQ measurements
-- Multilingual chatbot responses
-- Redis-backed persistent caching
+- Does not fetch AQI data
+- Does not store chat history
+- Does not perform caching (optional future enhancement)
+- Does not expose API keys
 
 ---
 
-**AirWatch Delhi now supports real-time, location-aware air quality insights with explainable reasoning and AI-assisted guidance—without compromising system stability.**
+## 5. `chatbot_view` (API Layer)
+
+### Purpose
+
+Exposes the chatbot as an **HTTP API endpoint**.
+
+---
+
+### Responsibilities
+
+- Validate request payload
+- Extract AQI, pollutant, and weather data
+- Call `chatbot_service`
+- Return AI-generated text
+
+---
+
+### Why This Is Kept Thin
+
+- Views should only handle HTTP concerns
+- All logic lives in services
+- Easier testing and maintenance
+
+---
+
+## Integration Summary
+
+### AQI Pipeline (Unchanged)
+
+```
+normalize_pollutants
+→ calculate_overall_aqi
+→ infer_pollution_reasons
+→ calculate_pollution_risk
+```
+
+### New Additions
+
+- OpenAQ point-based ingestion feeds into the pipeline
+- Chatbot consumes pipeline outputs to generate advice
+
+---
+
+## Key Architectural Guarantees
+
+- No service knows more than it should
+- External APIs are isolated
+- AQI math remains a single authority
+- Cache behavior is consistent
+- All additions are reversible
+
+---
+
+## For New Contributors
+
+If you are adding features:
+
+- **AQI logic → `calculate_aqi.py`**
+- **Orchestration → `area_service.py`**
+- **External APIs → service modules**
+- **HTTP logic → views only**
+
+Following this rule keeps the system stable.
 
 ---
