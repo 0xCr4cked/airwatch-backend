@@ -41,3 +41,37 @@ def dashboard_view(request):
     result = get_area_air_quality(area_id, mock_measurements)
 
     return JsonResponse(result, safe=False)
+
+
+# FOR CHAT BOT
+
+from dashboard.services.chatbot_service import get_chatbot_response
+
+
+@api_view(["POST"])
+def chatbot_view(request):
+    """
+    Chatbot endpoint for citizens and authorities.
+    """
+
+    data = request.data
+
+    user_type = data.get("user_type", "citizen")
+    user_query = data.get("query", "")
+
+    aqi_data = data.get("aqi", {})
+    pollutants = data.get("pollutants", {})
+    weather = data.get("weather", {})
+
+    if not user_query:
+        return Response({"error": "Query is required"}, status=400)
+
+    reply = get_chatbot_response(
+        user_type=user_type,
+        aqi_data=aqi_data,
+        pollutants=pollutants,
+        weather=weather,
+        user_query=user_query,
+    )
+
+    return Response({"reply": reply})

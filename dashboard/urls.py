@@ -21,4 +21,5 @@ from dashboard import views
 urlpatterns = [
     path("dashboard/", views.dashboard_view),
     path("point-aqi/", views.point_aqi),
+    path("chatbot/", views.chatbot_view),
 ]
